@@ -14,114 +14,127 @@ def extract_products_from_pdf(uploaded_file):
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     products = []
     
+    # Regex apenas para extrair valores limpos (não usado mais para encontrar o produto)
+    price_validator = re.compile(r"R\$\s?[\d,]+")
+    
     for page_num, page in enumerate(doc):
-        # 1. Mapear todos os blocos de texto com suas coordenadas
-        # blocks = (x0, y0, x1, y1, text, ...)
-        text_blocks = page.get_text("blocks")
+        # 1. Extração de Blocos de Texto e Imagens
+        text_blocks = page.get_text("blocks") # (x0, y0, x1, y1, text, block_no, block_type)
+        # Ordena blocos verticalmente (y0) para leitura sequencial
+        text_blocks.sort(key=lambda b: (b[1], b[0]))
         
-        # 2. Mapear todas as imagens com suas coordenadas
-        image_list = page.get_images(full=True)
-        page_images = []
-        for img in image_list:
+        images = page.get_images(full=True)
+        page_images_data = []
+        
+        # Prepara lista de imagens com suas posições
+        for img in images:
             xref = img[0]
             rects = page.get_image_rects(xref)
-            if rects:
-                # Considera a maior ocorrência da imagem (evita ícones duplicados)
-                r = max(rects, key=lambda x: x.width * x.height)
-                if r.width > 50 and r.height > 50: # Filtra sujeira
-                    page_images.append((xref, r))
+            if not rects: continue
+            # Considera apenas a primeira aparição da imagem na página
+            r = rects[0]
+            # Filtra ícones muito pequenos
+            if r.width < 50 or r.height < 50: continue
+            page_images_data.append({'xref': xref, 'rect': r, 'y': r.y0})
+            
+        # Ordena imagens pela posição vertical
+        page_images_data.sort(key=lambda x: x['y'])
 
-        # 3. ACHAR AS ÂNCORAS (Os Preços)
-        # O preço é o ponto central do card. Procuramos blocos com "R$" e "g"
-        price_blocks = []
-        for block in text_blocks:
-            text = block[4].strip()
-            # Limpeza básica para garantir match
-            if "R$" in text and "g" in text:
-                price_blocks.append(block)
-
-        # 4. MONTAR OS PRODUTOS BASEADO NAS ÂNCORAS
-        for p_block in price_blocks:
-            px0, py0, px1, py1, p_text, _, _ = p_block
+        # 2. Varredura por "Âncoras" (Linhas de Preço/Peso)
+        for i, block in enumerate(text_blocks):
+            block_text = block[4]
+            # Limpa quebras de linha extras para análise
+            clean_text = block_text.replace('\n', ' ').strip()
             
-            # --- A. ACHAR O NOME (Imediatamente ACIMA do preço) ---
-            best_name = "Nome Desconhecido"
-            min_dist_y = 9999
-            
-            # Centro horizontal do preço (para alinhar com o nome)
-            p_center_x = (px0 + px1) / 2
-            
-            for b in text_blocks:
-                bx0, by0, bx1, by1, b_text, _, _ = b
+            # A LÓGICA DE OURO: O produto é identificado pela linha de Preço + Peso
+            # Deve conter "R$" E "g" (gramas)
+            if "R$" in clean_text and "g" in clean_text:
                 
-                # Ignora o próprio bloco de preço
-                if b == p_block: continue
+                # --- A. EXTRAÇÃO DO NOME ---
+                # O nome está, visualmente, ACIMA do preço.
+                # Verificamos se está no mesmo bloco (linha anterior) ou no bloco anterior.
                 
-                # O bloco deve estar ACIMA do preço (by1 < py0)
-                # E deve estar ALINHADO horizontalmente (overlap)
-                if by1 <= py0 + 5: # +5 de tolerância
-                    dist_y = py0 - by1
-                    
-                    # Verifica alinhamento horizontal (se estão na mesma coluna)
-                    b_center_x = (bx0 + bx1) / 2
-                    dist_x = abs(p_center_x - b_center_x)
-                    
-                    # Critérios:
-                    # 1. Distância vertical pequena (máx 50px acima)
-                    # 2. Alinhamento horizontal próximo (máx 20px de desvio)
-                    if dist_y < 50 and dist_x < 40:
-                        if dist_y < min_dist_y:
-                            min_dist_y = dist_y
-                            best_name = b_text.strip().replace('\n', ' ')
+                lines = block_text.split('\n')
+                price_line_index = -1
+                
+                # Acha em qual linha do bloco está o preço
+                for idx, line in enumerate(lines):
+                    if "R$" in line and "g" in line:
+                        price_line_index = idx
+                        break
+                
+                raw_name = ""
+                
+                # CASO 1: O nome está no mesmo bloco, na linha de cima
+                if price_line_index > 0:
+                    raw_name = lines[price_line_index - 1].strip()
+                
+                # CASO 2: O nome está no bloco anterior (o mais comum se houver espaçamento)
+                elif i > 0:
+                    # Pega o texto do bloco anterior
+                    raw_name = text_blocks[i-1][4].replace('\n', ' ').strip()
+                
+                # --- CORREÇÃO DO BUG DO "R" E LIMPEZA ---
+                # Remove "Estoque" se tiver pegado errado
+                if "Estoque" in raw_name: 
+                    raw_name = "Nome Desconhecido"
+                
+                # Remove o " R" no final (erro de leitura do PDF)
+                if raw_name.endswith(" R"):
+                    product_code = raw_name[:-2].strip()
+                else:
+                    product_code = raw_name.strip()
 
-            # Limpeza do Nome (Remove "Estoque" ou lixo)
-            if "Estoque" in best_name: best_name = "Nome Indisponível"
-            if best_name.endswith(" R"): best_name = best_name[:-2] # Corrige bug visual
-
-            # --- B. ACHAR A IMAGEM (Imediatamente ABAIXO do preço) ---
-            best_image_bytes = None
-            best_img_xref = f"no_img_{page_num}_{py0}"
-            min_img_dist = 9999
-            
-            for xref, rect in page_images:
-                # Imagem deve estar ABAIXO do preço (rect.y0 >= py1)
-                # E alinhada horizontalmente
-                if rect.y0 >= py1 - 10: # -10 tolerância
-                    dist_y = rect.y0 - py1
+                # --- B. EXTRAÇÃO DE VALORES ---
+                # Pega Preço e Peso da linha atual
+                current_line = lines[price_line_index] if price_line_index != -1 else clean_text
+                
+                p_match = re.search(r'(R\$\s?[\d,]+)', current_line)
+                w_match = re.search(r'([\d,]+\s?g)', current_line)
+                
+                price = p_match.group(1) if p_match else ""
+                weight = w_match.group(1) if w_match else ""
+                
+                # --- C. VINCULAR A IMAGEM CORRETA ---
+                # A imagem do produto está VISUALMENTE ABAIXO da linha de preço.
+                # Procuramos a imagem mais próxima cujo topo (y0) seja maior que o preço (y1)
+                
+                price_block_y_bottom = block[3] # y1 do bloco de texto
+                best_image = None
+                min_dist = 9999
+                
+                for img_data in page_images_data:
+                    # A imagem deve começar abaixo do preço
+                    dist = img_data['rect'].y0 - price_block_y_bottom
                     
-                    img_center_x = (rect.x0 + rect.x1) / 2
-                    dist_x = abs(p_center_x - img_center_x)
+                    # Tolerância: Deve estar abaixo (dist > -10) e não muito longe (< 300px)
+                    if -10 < dist < 300:
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_image = img_data
+                
+                image_bytes = None
+                img_xref = f"no_img_{page_num}_{i}" # ID fallback
+                
+                if best_image:
+                    try:
+                        extracted = doc.extract_image(best_image['xref'])
+                        image_bytes = extracted["image"]
+                        img_xref = f"{page_num}_{best_image['xref']}"
+                    except:
+                        pass
+                
+                # Adiciona à lista final se tiver nome válido
+                if product_code and len(product_code) > 2:
+                    products.append({
+                        "id": img_xref,
+                        "image_bytes": image_bytes, # Pode ser None se não achar imagem
+                        "code": product_code,
+                        "price": price,
+                        "weight": weight,
+                        "raw_text": clean_text
+                    })
                     
-                    if dist_y < 100 and dist_x < 40: # Imagem logo abaixo
-                        if dist_y < min_img_dist:
-                            min_img_dist = dist_y
-                            try:
-                                extracted = doc.extract_image(xref)
-                                best_image_bytes = extracted["image"]
-                                best_img_xref = f"{page_num}_{xref}"
-                            except:
-                                pass
-
-            # --- C. EXTRAIR VALORES ---
-            # Extrai preço e peso do texto do bloco âncora
-            price_match = re.search(r'R\$\s?([\d,.]+)', p_text)
-            weight_match = re.search(r'\|\s?([\d,.]+)\s?g', p_text)
-            
-            price = price_match.group(1) if price_match else ""
-            weight = weight_match.group(1) if weight_match else ""
-            
-            # ADICIONAR À LISTA
-            # Usa o xref da imagem + index como ID único provisório
-            if best_name and best_name != "Nome Desconhecido":
-                products.append({
-                    "id": best_img_xref, 
-                    "image_bytes": best_image_bytes,
-                    "code": best_name,
-                    "price": price,
-                    "weight": weight,
-                    "raw_text": p_text
-                })
-
     return products
 
 # --- 2. GERADOR DE PDF ---
